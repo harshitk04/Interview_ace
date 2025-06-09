@@ -1,4 +1,3 @@
-# IMPORTANT: These two lines MUST be at the very top, before any other imports
 from gevent import monkey
 monkey.patch_all()
 
@@ -9,47 +8,88 @@ import io
 import base64
 import cv2
 import numpy as np
-
-# MediaPipe imports for the Tasks API
-import mediapipe as mp # General MediaPipe utilities like mp.Image
+import mediapipe as mp
 from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision
-
-# Imports for audio processing
 from pydub import AudioSegment
-import speech_recognition as sr # For Google Web Speech API (free, rate-limited)
+from faster_whisper import WhisperModel
+import tempfile
+import os
+
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 app = Flask(__name__)
-# Configure CORS for both HTTP routes and WebSocket connections
 CORS(app, resources={
     r"/analyze_interview": {"origins": "*"},
     r"/*": {"origins": "*"}
 })
-
-# Initialize Flask-SocketIO with gevent for asynchronous handling
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
-# --- MediaPipe Face Landmarker Setup ---
-# IMPORTANT: You need to download this file and place it in your python-backend directory:
-# https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
 model_path = 'face_landmarker.task'
 
-# Load the Face Landmarker model once when the application starts
 try:
     base_options = mp_tasks.BaseOptions(model_asset_path=model_path)
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
-        running_mode=vision.RunningMode.IMAGE, # Use IMAGE mode for processing individual frames
-        num_faces=1, # Detect up to 1 face
-        output_face_blendshapes=True # Get blendshapes (useful for gaze, though not used in current eye contact logic)
+        running_mode=vision.RunningMode.IMAGE,
+        num_faces=1,
+        output_face_blendshapes=True
     )
     face_landmarker = vision.FaceLandmarker.create_from_options(options)
     print("MediaPipe Face Landmarker model loaded successfully.")
 except Exception as e:
     print(f"ERROR: Failed to load MediaPipe Face Landmarker model from {model_path}. Make sure the file exists and is correct. Error: {e}")
-    face_landmarker = None # Set to None if loading fails to prevent further errors
+    face_landmarker = None
 
-# --- Flask Routes ---
+load_dotenv()
+
+google_api_key = os.getenv("GOOGLE_API_KEY")
+if not google_api_key:
+    print("ERROR: GOOGLE_API_KEY not found. Please set it in your .env file.")
+    llm_model = None
+else:
+    llm_model = ChatGoogleGenerativeAI(model='gemini-2.0-flash-lite-preview-02-05', 
+                                       temperature=0.7, 
+                                       google_api_key=google_api_key
+                                       )
+    output_parser = StrOutputParser()
+
+whisper_model_size = "small"
+whisper_model = None
+
+try:
+    print(f"Loading Whisper model '{whisper_model_size}' for MPS (Apple Silicon GPU)...")
+    whisper_model = WhisperModel(whisper_model_size, device="mps", compute_type="float16")
+    print(f"Whisper model '{whisper_model_size}' loaded successfully for MPS.")
+except Exception as e:
+    print(f"ERROR: Failed to load Whisper model on MPS. Make sure you have installed faster-whisper and torch with MPS support. Error: {e}")
+    print("Attempting to load on CPU as fallback (will be slower)...")
+    try:
+        whisper_model = WhisperModel(whisper_model_size, device="cpu")
+        print(f"Whisper model '{whisper_model_size}' loaded successfully on CPU.")
+    except Exception as cpu_e:
+        print(f"ERROR: Failed to load Whisper model on CPU either. Transcription will not work. Error: {cpu_e}")
+        whisper_model = None
+
+
+def get_langchain_gemini_response(system_prompt_content, user_prompt_content, model_instance, temperature=0.7):
+    if model_instance is None:
+        return "LLM service not available: Gemini model not initialized."
+    try:
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("system", system_prompt_content),
+            ("human", user_prompt_content)
+        ])
+        chain = prompt_template | model_instance | StrOutputParser()
+        response = chain.invoke({"text": ""})
+        return response
+    except Exception as e:
+        print(f"An error occurred with LangChain Gemini LLM call: {e}")
+        return f"LLM processing error: {e}"
+
 @app.route('/')
 def index():
     return "Python Backend for InterviewAce is running! Use /analyze_interview for audio analysis or WebSocket for eye tracking."
@@ -62,6 +102,8 @@ def analyze_interview():
 
     audio_file = request.files['audio']
     duration_str = request.form.get('duration')
+    question = request.form.get('question', 'No question provided.')
+    job_description = request.form.get('job_description', 'No job description provided.')
 
     if not duration_str:
         return jsonify({"error": "No duration provided"}), 400
@@ -71,45 +113,51 @@ def analyze_interview():
     except ValueError:
         return jsonify({"error": "Invalid duration format"}), 400
 
-    # Read WebM audio and convert to WAV in-memory using pydub
     webm_audio = io.BytesIO(audio_file.read())
-    wav_audio_io = io.BytesIO()
+    audio_filepath = None
+
     try:
-        # pydub requires ffmpeg or avconv to be installed on the system
         audio = AudioSegment.from_file(webm_audio, format="webm")
-        audio.export(wav_audio_io, format="wav")
-        wav_audio_io.seek(0) # Rewind the BytesIO object to the beginning
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav_file:
+            audio.export(tmp_wav_file.name, format="wav")
+            audio_filepath = tmp_wav_file.name
     except Exception as e:
-        print(f"Error converting audio with pydub: {e}")
-        return jsonify({"error": f"Failed to convert audio. Ensure FFmpeg is installed and accessible in your system's PATH. Error: {e}"}), 500
+        print(f"Error converting audio with pydub or saving temp file: {e}")
+        return jsonify({"error": f"Failed to convert audio or save for Whisper. Ensure FFmpeg is installed. Error: {e}"}), 500
 
-    # Use the Google Web Speech API for transcription
-    r = sr.Recognizer()
     transcript = ""
-    try:
-        with sr.AudioFile(wav_audio_io) as source:
-            audio_data = r.record(source) # Read the entire audio file
-            transcript = r.recognize_google(audio_data) # Send to Google Web Speech API
-            print(f"Transcript: {transcript}")
-    except sr.UnknownValueError:
-        print("Google Web Speech API could not understand audio.")
-        transcript = "Could not understand audio."
-    except sr.RequestError as e:
-        print(f"Could not request results from Google Web Speech API service; {e}. Check internet connection or API limits.")
-        transcript = f"Transcription service error: {e}"
-    except Exception as e:
-        print(f"General ASR error: {e}")
-        transcript = f"ASR processing error: {e}"
+    if whisper_model is None:
+        print("Whisper model not loaded. Skipping transcription.")
+        transcript = "Error: Transcription model not available."
+    else:
+        try:
+            print(f"Starting Whisper transcription for file: {audio_filepath}")
+            segments, info = whisper_model.transcribe(audio_filepath, beam_size=5)
+            
+            transcript_parts = []
+            for segment in segments:
+                transcript_parts.append(segment.text)
+            transcript = " ".join(transcript_parts)
+            
+            print(f"Whisper Transcript: {transcript}")
 
-    # --- Analysis Logic ---
+        except Exception as e:
+            print(f"Error during Whisper transcription: {e}")
+            transcript = f"Transcription error: {e}"
+        finally:
+            if audio_filepath and os.path.exists(audio_filepath):
+                try:
+                    os.remove(audio_filepath)
+                    print(f"Cleaned up temporary file: {audio_filepath}")
+                except Exception as cleanup_e:
+                    print(f"Warning: Could not remove temporary file {audio_filepath}: {cleanup_e}")
+
     filler_words = ["um", "uh", "like", "you know", "so", "basically", "actually"]
     filler_words_count = sum(transcript.lower().count(word) for word in filler_words)
 
     words = transcript.split()
-    # Calculate Words Per Minute (WPM)
     wpm = (len(words) / duration) * 60 if duration > 0 else 0
 
-    # Simple content relevance check
     expected_keywords = ["experience", "skills", "background", "passionate", "motivated", "team player", "problem-solving"]
     found_keywords_count = sum(1 for keyword in expected_keywords if keyword.lower() in transcript.lower())
     content_relevance_score = (found_keywords_count / len(expected_keywords)) * 100 if len(expected_keywords) > 0 else 0
@@ -132,17 +180,46 @@ def analyze_interview():
     else:
         suggestions.append("Good job including relevant content!")
 
-    # --- End Analysis Logic ---
+    qa_alignment_feedback = "N/A"
+    domain_keyword_feedback = "N/A"
+    abstractive_summary = "N/A"
+
+    if llm_model:
+        print("Starting LLM-powered analysis using LangChain and Gemini...")
+        
+        qa_system_prompt = "You are a helpful interview coach. Provide feedback on how well an interview answer addresses the given question."
+        qa_user_prompt = f"""Evaluate the following interview answer for its directness, relevance, and comprehensiveness to the given question.
+        Identify if the answer goes off-topic, is too brief, or misses key elements.
+        Provide concise feedback in bullet points, starting with positive aspects and then areas for improvement.
+
+        Question: {question}
+        Answer: {transcript}
+        """
+        qa_alignment_feedback = get_langchain_gemini_response(qa_system_prompt, qa_user_prompt, llm_model)
+        print(f"QA Alignment Feedback:\n{qa_alignment_feedback}\n---")
+
+        summary_system_prompt = "You are a concise summarization assistant."
+        summary_user_prompt = f"""Summarize the following interview answer concisely in 2-4 sentences, capturing the main points and key takeaways.
+
+        Interview Answer: {transcript}
+        """
+        abstractive_summary = get_langchain_gemini_response(summary_system_prompt, summary_user_prompt, llm_model, temperature=0.5)
+        print(f"Abstractive Summary:\n{abstractive_summary}\n---")
+    else:
+        print("Google Gemini API key missing or model not initialized, skipping LLM analysis.")
+
 
     return jsonify({
         "transcript": transcript,
         "filler_words_count": filler_words_count,
         "wpm": wpm,
         "content_relevance_score": content_relevance_score,
-        "suggestions": suggestions
+        "suggestions": suggestions,
+        "qa_alignment_feedback": qa_alignment_feedback,
+        "domain_keyword_feedback": domain_keyword_feedback,
+        "abstractive_summary": abstractive_summary
     })
 
-# --- WebSocket Event Handler for Eye Contact ---
 @socketio.on('video_frame')
 def handle_video_frame(data):
     if face_landmarker is None:
@@ -151,38 +228,29 @@ def handle_video_frame(data):
         return
 
     try:
-        # Extract base64 image data (e.g., "data:image/jpeg;base64,...")
-        # Split to get just the base64 part
         image_data = base64.b64decode(data['image'].split(',')[1])
         nparr = np.frombuffer(image_data, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR) # Decode image into OpenCV format
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        # Convert the BGR image (OpenCV default) to RGB as required by MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-        # Perform face landmark detection
         detection_result = face_landmarker.detect(mp_image)
 
-        eye_contact_status = 'No Face Detected' # Default status
+        eye_contact_status = 'No Face Detected'
 
         if detection_result.face_landmarks:
-            landmarks = detection_result.face_landmarks[0] # Get landmarks for the first detected face
+            landmarks = detection_result.face_landmarks[0]
             
-            # MediaPipe landmark indices for approximate eye centers (can vary, these are common)
-            # You might fine-tune these indices or use average of multiple points for robustness
-            left_eye_center_x = landmarks[33].x # Example: left eye pupil
+            left_eye_center_x = landmarks[33].x
             left_eye_center_y = landmarks[33].y
-            right_eye_center_x = landmarks[263].x # Example: right eye pupil
+            right_eye_center_x = landmarks[263].x
             right_eye_center_y = landmarks[263].y
 
-            # Simple heuristic for eye contact: Check if eyes are generally centralized within the frame
-            # Coordinates are normalized (0.0 to 1.0) relative to image width/height
-            # Adjust these thresholds based on your webcam, lighting, and desired sensitivity
             is_looking_central = (
-                abs(left_eye_center_x - 0.5) < 0.15 and # X-coordinate within 0.15 of center (0.5)
+                abs(left_eye_center_x - 0.5) < 0.15 and
                 abs(right_eye_center_x - 0.5) < 0.15 and
-                left_eye_center_y > 0.3 and left_eye_center_y < 0.7 and # Y-coordinate within 0.3 to 0.7 range
+                left_eye_center_y > 0.3 and left_eye_center_y < 0.7 and
                 right_eye_center_y > 0.3 and right_eye_center_y < 0.7
             )
 
@@ -191,18 +259,12 @@ def handle_video_frame(data):
             else:
                 eye_contact_status = 'Adjust Position'
         
-        # Emit the determined status back to the client that sent the frame
         emit('eye_contact_status', {'status': eye_contact_status})
 
     except Exception as e:
         print(f"Error processing video frame on backend: {e}")
-        # Emit an error status back to the client if something goes wrong during processing
         emit('eye_contact_status', {'status': 'Error (Backend)'})
 
-# --- Main entry point to run the Flask application ---
 if __name__ == '__main__':
-    # When using async_mode='gevent', you should run the app via socketio.run()
-    # If running in a production WSGI server (like Gunicorn), the server itself
-    # handles the gevent patching and app execution.
     print("Starting Flask-SocketIO server on http://localhost:8000...")
     socketio.run(app, debug=True, port=8000)
