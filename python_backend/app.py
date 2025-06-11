@@ -1,6 +1,6 @@
 from gevent import monkey
 monkey.patch_all()
-
+import re
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
@@ -103,7 +103,6 @@ def analyze_interview():
     audio_file = request.files['audio']
     duration_str = request.form.get('duration')
     question = request.form.get('question', 'No question provided.')
-    job_description = request.form.get('job_description', 'No job description provided.')
 
     if not duration_str:
         return jsonify({"error": "No duration provided"}), 400
@@ -196,6 +195,9 @@ def analyze_interview():
         Answer: {transcript}
         """
         qa_alignment_feedback = get_langchain_gemini_response(qa_system_prompt, qa_user_prompt, llm_model)
+        
+        if qa_alignment_feedback and qa_alignment_feedback != "LLM service not available: Gemini model not initialized.":
+            qa_alignment_feedback = re.sub(r'\*\*(.+?):\*\*', r'\1:', qa_alignment_feedback)
         print(f"QA Alignment Feedback:\n{qa_alignment_feedback}\n---")
 
         summary_system_prompt = "You are a concise summarization assistant."
@@ -204,10 +206,12 @@ def analyze_interview():
         Interview Answer: {transcript}
         """
         abstractive_summary = get_langchain_gemini_response(summary_system_prompt, summary_user_prompt, llm_model, temperature=0.5)
+        
+        if abstractive_summary and abstractive_summary != "LLM service not available: Gemini model not initialized.":
+            abstractive_summary = re.sub(r'^\s*\*\s*(?:\|)?\s*', '', abstractive_summary, flags=re.MULTILINE)
         print(f"Abstractive Summary:\n{abstractive_summary}\n---")
     else:
         print("Google Gemini API key missing or model not initialized, skipping LLM analysis.")
-
 
     return jsonify({
         "transcript": transcript,
